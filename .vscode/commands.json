@@ -1,0 +1,6 @@
+[
+  {
+    "label": "curl -i \\           -H \"X-Upload-Token: e4d9a08e4d4ef7158f272e3a938851852a0c97942d632043b572cabc82935dee\" \\   -F \"file=@./README.md\" \\   \"https://deploy.maila.email/upload?key=abc\"",
+    "command": "curl -i \\           -H \"X-Upload-Token: e4d9a08e4d4ef7158f272e3a938851852a0c97942d632043b572cabc82935dee\" \\   -F \"file=@./README.md\" \\   \"https://deploy.maila.email/upload?key=abc\""
+  }
+]
