@@ -1,43 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_URL_DEFAULT="https://github.com/778777266/deploy-sync"
-APP_DIR="/opt/deploy-sync"
-SERVICE_NAME="deploy-sync"
-APP_PORT="8000"
-APP_USER="fastapi"
-TOKEN_FILE="/root/deploy-sync-upload-token.txt"
-REPO_URL="${REPO_URL_DEFAULT}"
+# ===== config =====
+APP_DIR="${APP_DIR:-/opt/deploy-sync}"
+SERVICE_NAME="${SERVICE_NAME:-deploy-sync}"
+APP_PORT="${APP_PORT:-8000}"
+APP_USER="${APP_USER:-fastapi}"
+TOKEN_FILE="${TOKEN_FILE:-/root/deploy-sync-upload-token.txt}"
 
 DOMAIN=""
 
 usage() {
   echo "Usage: $0 --domain <your.domain>"
-  exit 1
-}
-
-parse_args() {
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --domain)
-        DOMAIN="${2:-}"
-        shift 2
-        ;;
-      --repo)
-        REPO_URL="${2:-}"
-        shift 2
-        ;;
-      *)
-        echo "Unknown arg: $1"
-        usage
-        ;;
-    esac
-  done
-
-  if [[ -z "${DOMAIN}" ]]; then
-    echo "ERROR: --domain is required"
-    usage
-  fi
 }
 
 require_root() {
@@ -47,22 +21,44 @@ require_root() {
   fi
 }
 
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --domain)
+        DOMAIN="${2:-}"
+        shift 2
+        ;;
+      *)
+        echo "Unknown arg: $1"
+        usage
+        exit 1
+        ;;
+    esac
+  done
+
+  if [[ -z "${DOMAIN}" ]]; then
+    echo "ERROR: --domain is required"
+    usage
+    exit 1
+  fi
+}
+
 install_packages() {
   echo "==> Install system packages..."
   apt update -y
   apt install -y \
     ca-certificates \
+    curl \
     git \
     nginx \
     python3 \
     python3-venv \
     python3-pip \
     ufw \
-    certbot \
-    python3-certbot-nginx \
     openssl \
-    curl \
-    iproute2
+    iproute2 \
+    certbot \
+    python3-certbot-nginx
 }
 
 configure_firewall() {
@@ -83,31 +79,23 @@ create_app_user() {
   fi
 }
 
-reset_app_dir() {
-  echo "==> Reset app directory..."
-  rm -rf "${APP_DIR}"
-  mkdir -p "${APP_DIR}"
-  chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
-}
-
-pull_repo() {
-  echo "==> Clone repo to ${APP_DIR}..."
-  git clone "${REPO_URL}" "${APP_DIR}"
-
+ensure_repo_files() {
+  echo "==> Check repo files..."
   if [[ ! -f "${APP_DIR}/main.py" ]]; then
-    echo "ERROR: main.py not found in ${APP_DIR}"
+    echo "ERROR: ${APP_DIR}/main.py not found"
     exit 1
   fi
   if [[ ! -f "${APP_DIR}/requirements.txt" ]]; then
-    echo "ERROR: requirements.txt not found in ${APP_DIR}"
+    echo "ERROR: ${APP_DIR}/requirements.txt not found"
     exit 1
   fi
-
-  chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
 }
 
 setup_venv_and_deps() {
   echo "==> Create venv and install deps from requirements.txt..."
+  mkdir -p "${APP_DIR}"
+  chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
+
   sudo -u "${APP_USER}" -H bash -lc "python3 -m venv '${APP_DIR}/.venv'"
   sudo -u "${APP_USER}" -H bash -lc "source '${APP_DIR}/.venv/bin/activate' && python -m pip install --upgrade pip wheel && pip install -r '${APP_DIR}/requirements.txt'"
 }
@@ -137,7 +125,7 @@ SERVICEEOF
   systemctl enable --now "${SERVICE_NAME}.service"
 }
 
-rotate_upload_token_env() {
+rotate_token_and_set_env() {
   echo "==> Rotate UPLOAD_TOKEN and set systemd environment..."
   local token
   token="$(openssl rand -hex 32)"
@@ -154,7 +142,6 @@ EOF
   systemctl daemon-reload
   systemctl restart "${SERVICE_NAME}.service"
 
-  # 你要求：每次部署都打印 token
   echo "==> UPLOAD_TOKEN: ${token}"
   echo "==> UPLOAD_TOKEN file: ${TOKEN_FILE}"
 }
@@ -169,14 +156,7 @@ health_check_local() {
   done
 
   echo "==> Health check: http://127.0.0.1:${APP_PORT}/docs"
-  if ! curl -fsS -o /dev/null "http://127.0.0.1:${APP_PORT}/docs"; then
-    echo "ERROR: backend health check failed."
-    systemctl --no-pager -l status "${SERVICE_NAME}.service" || true
-    journalctl -u "${SERVICE_NAME}.service" -n 200 --no-pager || true
-    echo "Port status:"
-    ss -lntp | grep ":${APP_PORT}" || true
-    exit 1
-  fi
+  curl -fsS -o /dev/null "http://127.0.0.1:${APP_PORT}/docs"
   echo "==> Backend is healthy."
 }
 
@@ -224,12 +204,10 @@ server {
     location / {
         proxy_pass http://127.0.0.1:${APP_PORT};
         proxy_http_version 1.1;
-
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;
-
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
     }
@@ -255,9 +233,11 @@ final_notes() {
   echo "UFW:   ufw status"
   echo "Open:  https://${DOMAIN}/docs"
   echo ""
-  echo "Token ops:"
-  echo "  Print : sudo bash ${APP_DIR}/scripts/token.sh print"
-  echo "  Rotate: sudo bash ${APP_DIR}/scripts/token.sh rotate"
+  echo "UPLOAD_TOKEN file: ${TOKEN_FILE}"
+  echo ""
+  echo "UPLOAD_TOKEN (print again at end):"
+  cat "${TOKEN_FILE}"
+  echo ""
 }
 
 main() {
@@ -266,11 +246,10 @@ main() {
   install_packages
   configure_firewall
   create_app_user
-  reset_app_dir
-  pull_repo
+  ensure_repo_files
   setup_venv_and_deps
   create_systemd_service
-  rotate_upload_token_env
+  rotate_token_and_set_env
   health_check_local
   issue_cert_http01_no_email
   configure_nginx
