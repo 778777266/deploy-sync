@@ -18,5 +18,9 @@
   {
     "label": "git push",
     "command": "git push"
+  },
+  {
+    "label": "git push --force origin main (强制覆盖远程，替换为你的分支名)",
+    "command": "git push --force origin main"
   }
 ]
