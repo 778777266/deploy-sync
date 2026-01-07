@@ -1,6 +1,6 @@
 [
   {
-    "label": "curl -i \\           -H \"X-Upload-Token: e4d9a08e4d4ef7158f272e3a938851852a0c97942d632043b572cabc82935dee\" \\   -F \"file=@./README.md\" \\   \"https://deploy.maila.email/upload?key=abc\"",
-    "command": "curl -i \\           -H \"X-Upload-Token: e4d9a08e4d4ef7158f272e3a938851852a0c97942d632043b572cabc82935dee\" \\   -F \"file=@./README.md\" \\   \"https://deploy.maila.email/upload?key=abc\""
+    "label": "curl -i \\           -H \"X-Upload-Token: 4b9b3cb004ae98d555148d7661e885cb86c18f65225fcbfa0a85e8183ad0aad6\" \\   -F \"file=@./README.md\" \\   \"https://deploy.maila.email/upload?key=abc\"",
+    "command": "curl -i \\           -H \"X-Upload-Token: 4b9b3cb004ae98d555148d7661e885cb86c18f65225fcbfa0a85e8183ad0aad6\" \\   -F \"file=@./README.md\" \\   \"https://deploy.maila.email/upload?key=abc\""
   }
 ]
