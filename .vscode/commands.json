@@ -20,6 +20,10 @@
     "command": "git push"
   },
   {
+    "label": "git add -A（记录所有变更，包括删除 .vscode）",
+    "command": "git add -A"
+  },
+  {
     "label": "git push --force origin main (强制覆盖远程，替换为你的分支名)",
     "command": "git push --force origin main"
   }
