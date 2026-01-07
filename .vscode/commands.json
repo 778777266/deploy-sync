@@ -1,6 +1,22 @@
 [
   {
-    "label": "curl -i \\           -H \"X-Upload-Token: 4b9b3cb004ae98d555148d7661e885cb86c18f65225fcbfa0a85e8183ad0aad6\" \\   -F \"file=@./README.md\" \\   \"https://deploy.maila.email/upload?key=abc\"",
-    "command": "curl -i \\           -H \"X-Upload-Token: 4b9b3cb004ae98d555148d7661e885cb86c18f65225fcbfa0a85e8183ad0aad6\" \\   -F \"file=@./README.md\" \\   \"https://deploy.maila.email/upload?key=abc\""
+    "label": "上传文件测试",
+    "command": "curl -i -H \"X-Upload-Token: 4b9b3cb004ae98d555148d7661e885cb86c18f65225fcbfa0a85e8183ad0aad6\" -F \"file=@./README.md\" \"https://deploy.maila.email/upload\\?key=abc\""
+  },
+  {
+    "label": "获取临时上传token",
+    "command": "curl -sS --progress-bar -X POST -H \"X-Upload-Token: 4b9b3cb004ae98d555148d7661e885cb86c18f65225fcbfa0a85e8183ad0aad6\" \"https://deploy.maila.email/upload-token\"; echo"
+  },
+  {
+    "label": "git add .",
+    "command": "git add ."
+  },
+  {
+    "label": "git commit -m '2'",
+    "command": "git commit -m '2'"
+  },
+  {
+    "label": "git push",
+    "command": "git push"
   }
 ]

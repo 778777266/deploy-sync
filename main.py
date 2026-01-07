@@ -1,26 +1,30 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Response
+from fastapi import FastAPI, UploadFile, File, HTTPException, Header
 from fastapi.responses import PlainTextResponse
-import uuid, os, base64, time, secrets
+import uuid
+import os
+import base64
+import time
+import secrets
 
 app = FastAPI()
-tasks = {}
+tasks: dict[str, dict[str, str]] = {}
 
 UPLOAD_TOKEN = os.getenv("UPLOAD_TOKEN", "")
 ONE_TIME_TOKEN_TTL_SECONDS = int(os.getenv("ONE_TIME_TOKEN_TTL_SECONDS", "600"))  # 默认10分钟
 
-# 内存里存一次性token：token -> expire_at
+# 一次性 token：token -> expire_at（epoch seconds）
 one_time_tokens: dict[str, float] = {}
 
 
 def _cleanup_expired_one_time_tokens() -> None:
-    """清理过期的一次性token（简单做法：每次调用顺手清一下）"""
+    """清理过期的一次性 token"""
     now = time.time()
     expired = [t for t, exp in one_time_tokens.items() if exp <= now]
     for t in expired:
         del one_time_tokens[t]
 
 
-def require_token(x_upload_token: str | None):
+def require_token(x_upload_token: str | None) -> None:
     """
     兼容两种鉴权：
     1) 长期 UPLOAD_TOKEN（原有逻辑）
@@ -32,18 +36,18 @@ def require_token(x_upload_token: str | None):
     if not x_upload_token:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # 1) 先兼容原有：长期token
+    # 1) 长期 token 直接放行
     if x_upload_token == UPLOAD_TOKEN:
         return
 
-    # 2) 再判断一次性token
+    # 2) 一次性 token 校验
     _cleanup_expired_one_time_tokens()
     exp = one_time_tokens.get(x_upload_token)
     if not exp:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # 存在但过期（理论上 cleanup 会清掉，这里再兜底一次）
     if exp <= time.time():
+        # 过期就删掉
         del one_time_tokens[x_upload_token]
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -57,14 +61,14 @@ async def issue_one_time_upload_token(
     x_upload_token: str | None = Header(default=None, alias="X-Upload-Token"),
 ):
     """
-    获取一次性上传token：
-    - 必须用长期 UPLOAD_TOKEN 来调用（防止被滥发）
+    获取一次性上传 token：
+    - 必须用长期 UPLOAD_TOKEN 调用（防止被滥发）
     - 返回纯文本 token
     """
     if not UPLOAD_TOKEN:
         raise RuntimeError("UPLOAD_TOKEN not set")
 
-    # 这里必须是长期token才允许签发一次性token
+    # 只允许长期 token 签发
     if x_upload_token != UPLOAD_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -81,14 +85,28 @@ async def upload_file(
     file: UploadFile = File(...),
     x_upload_token: str | None = Header(default=None, alias="X-Upload-Token"),
 ):
-    # 上传需要鉴权（长期token 或 一次性token）
+    # 上传需要鉴权（长期 token 或 一次性 token）
     require_token(x_upload_token)
 
     task_id = str(uuid.uuid4())
     file_path = f"/tmp/{task_id}.bin"
 
-    with open(file_path, "wb") as f:
-        f.write(await file.read())
+    # 分块写盘，避免大文件 OOM；中断时清理残留
+    try:
+        with open(file_path, "wb") as f:
+            while True:
+                chunk = await file.read(1024 * 1024)  # 1MB
+                if not chunk:
+                    break
+                f.write(chunk)
+    except Exception:
+        # 客户端取消/网络异常/写盘异常：尽量删除残留文件
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        except Exception:
+            pass
+        raise
 
     tasks[task_id] = {"key": key, "file_path": file_path}
 
