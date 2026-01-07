@@ -5,6 +5,7 @@ from fastapi import (
     HTTPException,
     Header,
     BackgroundTasks,
+    Query,
 )
 from fastapi.responses import PlainTextResponse, FileResponse
 import uuid
@@ -12,20 +13,34 @@ import os
 import base64
 import time
 import secrets
+import re
 
 app = FastAPI()
 
-# task_id -> {"key": str, "file_path": str, "burn_on_download": bool, "created_at": float}
-tasks: dict[str, dict[str, object]] = {}
-
+# ------------------------
+# Config
+# ------------------------
 UPLOAD_TOKEN = os.getenv("UPLOAD_TOKEN", "")
 ONE_TIME_TOKEN_TTL_SECONDS = int(os.getenv("ONE_TIME_TOKEN_TTL_SECONDS", "600"))  # 默认10分钟
+
+# 存储目录（长期 token 上传的 task 文件）
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/tmp")
+
+# 一次性 latest 槽位（一次性 token 上传会覆盖这里）
+ONE_TIME_LATEST_PATH = os.getenv("ONE_TIME_LATEST_PATH", "/tmp/deploy-sync-latest.tar")
+ONE_TIME_LATEST_META = os.getenv("ONE_TIME_LATEST_META", "/tmp/deploy-sync-latest.meta")  # 保存 key 等元信息
+
+# ------------------------
+# In-memory state (will reset on restart)
+# ------------------------
+# task_id -> {"key": str, "file_path": str, "burn_on_download": bool, "created_at": float}
+tasks: dict[str, dict[str, object]] = {}
 
 # 一次性 token：token -> expire_at（epoch seconds）
 one_time_tokens: dict[str, float] = {}
 
-# 记录“当前活跃的一次性上传任务”（用于下一次一次性上传时删除旧文件）
-active_one_time_task_id: str | None = None
+# UUID 形式校验（防目录穿越）
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 
 def _cleanup_expired_one_time_tokens() -> None:
@@ -35,25 +50,26 @@ def _cleanup_expired_one_time_tokens() -> None:
         del one_time_tokens[t]
 
 
+def _delete_task_file_only(file_path: str) -> None:
+    try:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+    except Exception:
+        pass
+
+
 def _delete_task(task_id: str) -> None:
     """删除某个任务的文件与记录（尽量不抛异常）"""
     task = tasks.get(task_id)
     if not task:
         return
     file_path = task.get("file_path")
-    try:
-        if isinstance(file_path, str) and os.path.exists(file_path):
-            os.remove(file_path)
-    except Exception:
-        pass
+    if isinstance(file_path, str):
+        _delete_task_file_only(file_path)
     try:
         del tasks[task_id]
     except Exception:
         pass
-
-    global active_one_time_task_id
-    if active_one_time_task_id == task_id:
-        active_one_time_task_id = None
 
 
 def authorize_token(x_upload_token: str | None) -> str:
@@ -68,11 +84,9 @@ def authorize_token(x_upload_token: str | None) -> str:
     if not x_upload_token:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # 1) 长期 token
     if x_upload_token == UPLOAD_TOKEN:
         return "long"
 
-    # 2) 一次性 token
     _cleanup_expired_one_time_tokens()
     exp = one_time_tokens.get(x_upload_token)
     if not exp:
@@ -82,9 +96,34 @@ def authorize_token(x_upload_token: str | None) -> str:
         del one_time_tokens[x_upload_token]
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # 用一次即焚：鉴权通过就删除
+    # 一次性 token 用一次即焚
     del one_time_tokens[x_upload_token]
     return "one_time"
+
+
+def _write_stream_to_path(upload_file: UploadFile, dst_path: str) -> None:
+    """
+    分块写盘（同步函数但在 async 里调用也可用；此处用 await file.read 分块）
+    注意：由调用方负责 try/except 清理
+    """
+    # 这个函数只负责路径写入，调用方循环 await read
+    raise NotImplementedError
+
+
+async def _save_uploadfile_to_disk(upload_file: UploadFile, dst_path: str) -> None:
+    """分块保存 UploadFile 到磁盘，避免 OOM"""
+    with open(dst_path, "wb") as f:
+        while True:
+            chunk = await upload_file.read(1024 * 1024)  # 1MB
+            if not chunk:
+                break
+            f.write(chunk)
+
+
+def _ensure_parent_dir(path: str) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
 
 
 @app.post("/upload-token", response_class=PlainTextResponse)
@@ -93,7 +132,7 @@ async def issue_one_time_upload_token(
 ):
     """
     获取一次性上传 token：
-    - 必须用长期 UPLOAD_TOKEN 调用（防止被滥发）
+    - 必须用长期 UPLOAD_TOKEN 调用
     - 返回纯文本 token
     """
     if not UPLOAD_TOKEN:
@@ -103,7 +142,6 @@ async def issue_one_time_upload_token(
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     _cleanup_expired_one_time_tokens()
-
     token = secrets.token_hex(32)
     one_time_tokens[token] = time.time() + ONE_TIME_TOKEN_TTL_SECONDS
     return token
@@ -111,51 +149,61 @@ async def issue_one_time_upload_token(
 
 @app.post("/upload", response_class=PlainTextResponse)
 async def upload_file(
-    key: str,
+    key: str = Query(...),
     file: UploadFile = File(...),
     x_upload_token: str | None = Header(default=None, alias="X-Upload-Token"),
 ):
-    global active_one_time_task_id
-
+    """
+    上传入口（兼容两种鉴权）：
+    - 长期 token：生成 task_id，保存到 /tmp/<task_id>.bin，下载后删除
+    - 一次性 token：写入 latest 槽位文件（覆盖旧文件），下载不删除（直到下次覆盖）
+    """
     auth_type = authorize_token(x_upload_token)
 
-    # 一次性 token 上传：先删除旧文件（旧的一次性上传）
-    if auth_type == "one_time" and active_one_time_task_id:
-        _delete_task(active_one_time_task_id)
-        active_one_time_task_id = None
+    # 一次性 token：写 latest 槽位（覆盖旧）
+    if auth_type == "one_time":
+        _ensure_parent_dir(ONE_TIME_LATEST_PATH)
+        _ensure_parent_dir(ONE_TIME_LATEST_META)
 
-    task_id = str(uuid.uuid4())
-    file_path = f"/tmp/{task_id}.bin"
+        tmp_path = ONE_TIME_LATEST_PATH + ".part"
 
-    # 分块写盘，避免大文件 OOM；中断时清理残留
-    try:
-        with open(file_path, "wb") as f:
-            while True:
-                chunk = await file.read(1024 * 1024)  # 1MB
-                if not chunk:
-                    break
-                f.write(chunk)
-    except Exception:
         try:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-        except Exception:
-            pass
-        raise
+            # 先写入临时文件，成功后原子替换，避免写一半留下坏文件
+            await _save_uploadfile_to_disk(file, tmp_path)
+            os.replace(tmp_path, ONE_TIME_LATEST_PATH)
 
-    burn_on_download = (auth_type == "long")
+            # 写 meta（保存 key 等信息）
+            meta_tmp = ONE_TIME_LATEST_META + ".part"
+            with open(meta_tmp, "w", encoding="utf-8") as mf:
+                mf.write(f"key={key}\n")
+                mf.write(f"updated_at={time.time()}\n")
+            os.replace(meta_tmp, ONE_TIME_LATEST_META)
+
+        except Exception:
+            # 清理临时文件
+            _delete_task_file_only(tmp_path)
+            raise
+
+        # 返回一个固定标识，告诉客户端用 latest 下载
+        return "latest"
+
+    # 长期 token：按 task_id 保存
+    task_id = str(uuid.uuid4())
+    _ensure_parent_dir(UPLOAD_DIR)
+    file_path = os.path.join(UPLOAD_DIR, f"{task_id}.bin")
+
+    try:
+        await _save_uploadfile_to_disk(file, file_path)
+    except Exception:
+        _delete_task_file_only(file_path)
+        raise
 
     tasks[task_id] = {
         "key": key,
         "file_path": file_path,
-        "burn_on_download": burn_on_download,
+        "burn_on_download": True,  # 长期 token 上传：下载后删除
         "created_at": time.time(),
     }
-
-    # 记录最新一次性上传（下一次一次性上传会删除它）
-    if auth_type == "one_time":
-        active_one_time_task_id = task_id
-
     return task_id
 
 
@@ -177,7 +225,7 @@ async def download(task_id: str):
     with open(file_path, "rb") as f:
         content = f.read()
 
-    # 长期 token 上传：下载后删除；一次性 token 上传：下载不删除
+    # 长期 token：阅后即焚
     if bool(task.get("burn_on_download", True)):
         _delete_task(task_id)
 
@@ -188,11 +236,9 @@ async def download(task_id: str):
 @app.get("/download-file/{task_id}")
 async def download_file(task_id: str, background_tasks: BackgroundTasks):
     """
-    新增：流式下载接口（适合大文件）
-    - 直接返回二进制文件（不 base64）
-    - 删除策略与 /download 保持一致：
-      * 长期 token 上传：传完后删除
-      * 一次性 token 上传：不删除（直到下次一次性上传替换掉）
+    流式下载：
+    - task_id 下载：仅支持当前进程内存 tasks 中存在的 task（长期 token 上传产生的）
+    - latest 下载：用 /download-file/latest
     """
     task = tasks.get(task_id)
     if not task:
@@ -203,14 +249,72 @@ async def download_file(task_id: str, background_tasks: BackgroundTasks):
         _delete_task(task_id)
         raise HTTPException(status_code=404, detail="ID无效或已被使用")
 
-    # 下载完成后再删除（避免边传边删）
+    # 传完再删
     if bool(task.get("burn_on_download", True)):
         background_tasks.add_task(_delete_task, task_id)
 
-    # 给个友好的文件名
-    filename = f"{task_id}.bin"
     return FileResponse(
         path=file_path,
         media_type="application/octet-stream",
-        filename=filename,
+        filename=f"{task_id}.bin",
+    )
+
+
+@app.get("/download-file/latest")
+async def download_latest():
+    """
+    一次性 token 上传的 latest 文件流式下载（不删除，直到下次覆盖）
+    """
+    if not os.path.exists(ONE_TIME_LATEST_PATH):
+        raise HTTPException(status_code=404, detail="latest not found")
+
+    # 读取 meta 里的 key（如果没有 meta，也给空）
+    key = ""
+    if os.path.exists(ONE_TIME_LATEST_META):
+        try:
+            with open(ONE_TIME_LATEST_META, "r", encoding="utf-8") as mf:
+                for line in mf:
+                    if line.startswith("key="):
+                        key = line.strip().split("=", 1)[1]
+                        break
+        except Exception:
+            key = ""
+
+    # 把 key 放在响应头里，便于客户端拿（不改变 body）
+    headers = {}
+    if key:
+        headers["X-AES-Key"] = key
+
+    return FileResponse(
+        path=ONE_TIME_LATEST_PATH,
+        media_type="application/octet-stream",
+        filename="latest.bin",
+        headers=headers,
+    )
+
+
+@app.get("/download-by-file/{task_id}")
+async def download_by_file(
+    task_id: str,
+    x_upload_token: str | None = Header(default=None, alias="X-Upload-Token"),
+):
+    """
+    救援接口：当 tasks 内存丢失但 /tmp/<task_id>.bin 仍在时使用
+    - 必须鉴权（长期 token 或一次性 token）
+    - 只允许 UUID 形式 task_id，防止路径穿越
+    - 直接从 /tmp/<task_id>.bin 读取并流式返回
+    """
+    authorize_token(x_upload_token)
+
+    if not UUID_RE.match(task_id):
+        raise HTTPException(status_code=400, detail="Invalid task_id format")
+
+    file_path = f"/tmp/{task_id}.bin"
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    return FileResponse(
+        path=file_path,
+        media_type="application/octet-stream",
+        filename=f"{task_id}.bin",
     )
